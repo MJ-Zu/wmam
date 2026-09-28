@@ -1,0 +1,7 @@
+jax>=0.4
+flax>=0.8
+optax>=0.2
+numpy>=1.24
+matplotlib>=3.7
+# For a GPU, install the CUDA build of JAX instead of plain jax, e.g.:
+#   pip install -U "jax[cuda12]"
