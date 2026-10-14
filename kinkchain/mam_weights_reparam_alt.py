@@ -25,11 +25,9 @@ plain-GD lr, not a tiny one -- a classification loss needs enough step to
 actually re-fit labels / traverse to tau_read; a tiny lr cannot and the signal
 vanishes. The refine phase provides the clean fixed-lr settling instead.
 
-Run from the project root:
-    python -m kinkchain.mam_weights_logging                 # bulk cyclic training
-    python -m kinkchain.mam_weights_logging --refine --load runs/wmam_cyclic.npz   # refine cyclic training
-    python -m kinkchain.mam_weights_logging --readout       # readout
-    python -m kinkchain.mam_weights_logging --readout --load runs/wmam_refine_cyclic.npz
+This module is a library. Runs are started from a setup file (JSON / pickle, see
+setup_io.py) with `python -m kinkchain.run_setup --setup <file> --out <file>`; its
+old flag-based command line and the .npz setup files were removed.
 """
 
 from __future__ import annotations
@@ -68,26 +66,28 @@ class WMAMConfig:
     near_band: float = 0.12      # |a - tau_max| < near_band = "near boundary"
     # --- bulk phase (RMSProp-no-momentum + cosine-decayed lr) ---
     bulk_optimizer: str = "adam"   # "rmsprop" | "adam" | "gd"
-    lr: float = 1e-1                  # 1e-2bulk base lr
-    bulk_afactor: float = 0.9         # 0.3 cosine decay: lr -> lr*afactor over max_steps
-    n_cycles: int = 20                # max bulk cycles (stops early on MAM-approach)
-    max_steps: int = 500              # per-target step cap
-    tol: float = 1e-11                # per-target convergence tol (classification) 1e-4
+    bulk_lr: float = 1e-1                  # 1e-2bulk base lr
+    bulk_afactor: float = 0.3         # 0.3 cosine decay: lr -> lr*afactor over max_steps
+    bulk_cycles: int = 30                # max bulk cycles (stops early on MAM-approach)
+    bulk_max_steps: int = 500              # per-target step cap
+    bulk_tol: float = 1e-11                # per-target convergence tol (classification) 1e-4
     # --- MAM-approach detection ---
     converge_tol: float = 1e-11        # cycle "converged" if every target's loss < this
     dD_patience: int = 3
     dD_plateau_rel: float = 0.01
     # --- refine phase (plain fixed-lr GD) ---
+    refine_optimizer: str = "gd"   # "rmsprop" | "adam" | "gd"
     refine_cycles: int = 100
     refine_lr: float = 1e-4
+    refine_afactor: float = 1.0
     refine_max_steps: int = 1000
     refine_tol: float = 1e-10
     # --- readout (plain GD, MODERATE lr so labels can be re-fit) ---
-    readout_lr: float = 1e-4
-    
+    readout_lr: float = 1e-4 
     readout_max_steps: int = 1000
     budget_steps: int = 500
     readout_tol: float = 1e-10
+
     # --- optimization noise (off by default; applied only during bulk) ---
     batch_size: int = 0
     augment: bool = False
@@ -144,9 +144,22 @@ def _augment(Xb, key):
     bright = jax.random.uniform(k2, (b, 1, 1, 1), minval=-0.3, maxval=0.3)
     return Xb + bright
 
+def rescale_kinked_gradients(scales, mask, floor=1.0):
+    scale = jax.tree_util.tree_map(
+        lambda s, m: jnp.where(m, 1.0 / jnp.maximum(jnp.abs(s), floor), 1.0),
+        scales, mask)
+
+    def init_fn(params):
+        return optax.EmptyState()
+
+    def update_fn(grads, state, params=None):
+        return jax.tree_util.tree_map(lambda g, sc: g * sc, grads, scale), state
+
+    return optax.GradientTransformation(init_fn, update_fn)
 
 
-def make_budget(model, knots, scales, mask, Xtr, atr, steps, lr, grad_clip=None):
+def make_budget(model, opt_name, knots, scales, mask, Xtr, atr, steps, lr, 
+                rescale_kink=True, grad_clip=None):
     """Fixed-budget full-batch plain GD; returns residual full-batch loss."""
     def logits(th, X):
         return model.apply({"params": reparam_alt(th, knots, scales, mask)}, X)
@@ -154,9 +167,23 @@ def make_budget(model, knots, scales, mask, Xtr, atr, steps, lr, grad_clip=None)
         lab = (atr >= tau).astype(jnp.float32)
         return optax.sigmoid_binary_cross_entropy(logits(th, Xtr), lab).mean()
     gfull = jax.grad(full_loss)
-#    opt = optax.sgd(lr)
-    opt = (optax.chain(optax.clip(grad_clip), optax.sgd(lr, momentum=None))
-           if grad_clip is not None else optax.sgd(lr, momentum=None))
+    
+    base_opt = {"gd": optax.sgd(lr, momentum=None),
+                "rmsprop": optax.rmsprop(lr, momentum=None),
+                "adam": optax.adam(lr)}[opt_name]
+
+    transforms = []
+    if rescale_kink:
+        transforms.append(rescale_kinked_gradients(scales, mask))
+    if grad_clip is not None:
+        transforms.append(optax.clip(grad_clip))
+    transforms.append(base_opt)
+
+    opt = optax.chain(*transforms) if len(transforms) > 1 else transforms[0]
+
+#   opt = (optax.chain(rescale_kinked_gradients(scales, mask),
+#                 optax.clip(grad_clip), optax.sgd(lr, momentum=None))
+#          if grad_clip is not None else optax.sgd(lr, momentum=None))
 
     @jax.jit
     def budget(theta, tau):
@@ -175,9 +202,20 @@ def make_budget(model, knots, scales, mask, Xtr, atr, steps, lr, grad_clip=None)
 # records the flattened parameter vector and the full-batch loss at EVERY step
 # into static (max_steps+1, n) buffers. The while_loop still early-exits at
 # convergence, so no steps are wasted; `_truncate` drops the untouched tail.
+#
+# log_every=k > 1 records only every k-th step (steps 0, k, 2k, ...) plus the
+# final state, DURING training, so the device buffer is (max_steps // k + 3, n)
+# instead of (max_steps + 1, n) -- what makes big networks / long runs fit on a
+# GPU. The trajectory itself is unchanged; the recorded rows are exactly those
+# the host-side `_truncate(..., stride=k)` would keep. Read the valid rows with
+# `_truncate_logged(bt, bl, ns, k)`. k=1 (default) is the original code path.
 # ----------------------------------------------------------------------------
 def make_logging_trainer(model, knots, scales, mask, Xtr, atr, Xte, ate, *, max_steps, tol,
-                         opt_name, lr, afactor, batch=0, grad_clip=None, augment=False):
+                         opt_name, lr, afactor, batch=0, rescale_kink=False, grad_clip=None, augment=False,
+                         log_every=1):
+    if int(log_every) != log_every or log_every < 1:
+        raise ValueError(f"log_every must be a positive integer, got {log_every!r}")
+    log_every = int(log_every)
     n_data = Xtr.shape[0]
 
     def logits(th, X):
@@ -195,22 +233,41 @@ def make_logging_trainer(model, knots, scales, mask, Xtr, atr, Xte, ate, *, max_
         lab = (ate >= tau).astype(jnp.float32)
         return optax.sigmoid_binary_cross_entropy(logits(th, Xte), lab).mean()
 
+
     gbatch = jax.grad(batch_loss)
     sched = optax.cosine_decay_schedule(lr, max_steps, afactor)
-    if grad_clip is None:
-       opt = {"gd": optax.sgd(sched, momentum=None),
-              "rmsprop": optax.rmsprop(sched, momentum=None),
-              "adam": optax.adam(sched)}[opt_name]
-    else:
-       opt = {"gd": optax.chain(optax.clip(grad_clip), optax.sgd(sched, momentum=None)),
-              "rmsprop": optax.chain(optax.clip(grad_clip), optax.rmsprop(sched, momentum=None)),
-              "adam": optax.chain(optax.clip(grad_clip), optax.adam(sched))}[opt_name]
+
+    base_opt = {"gd": optax.sgd(sched, momentum=None),
+                "rmsprop": optax.rmsprop(sched, momentum=None),
+                "adam": optax.adam(sched)}[opt_name]
+
+    transforms = []
+    if rescale_kink:
+        transforms.append(rescale_kinked_gradients(scales, mask))
+    if grad_clip is not None:
+        transforms.append(optax.clip(grad_clip))
+    transforms.append(base_opt)
+
+    opt = optax.chain(*transforms) if len(transforms) > 1 else transforms[0]
+
+#   if grad_clip is None:
+#      opt = {"gd": optax.sgd(sched, momentum=None),
+#             "rmsprop": optax.rmsprop(sched, momentum=None),
+#             "adam": optax.adam(sched)}[opt_name]
+#   else:
+#      opt = {"gd": optax.chain(rescale_kinked_gradients(B["scales"], B["mask"]),
+#                   optax.clip(grad_clip), optax.sgd(sched, momentum=None)),
+#             "rmsprop": optax.chain(optax.clip(grad_clip), optax.rmsprop(sched, momentum=None)),
+#             "adam": optax.chain(optax.clip(grad_clip), optax.adam(sched))}[opt_name]
 
     @jax.jit
     def train_log(theta, tau, key):
         flat0, _ = ravel_pytree(theta)
         n = flat0.shape[0]
-        rows = max_steps + 1
+        # log_every > 1: slots 0..max_steps//k are the periodic rows, the next one the
+        # final state (when it is not itself a periodic row), the last one a scratch
+        # row that absorbs the writes of the steps that are not recorded.
+        rows = max_steps + 1 if log_every == 1 else max_steps // log_every + 3
         st = opt.init(theta)
         l0 = full_loss(theta, tau)
         bt0 = jnp.zeros((rows, n), flat0.dtype).at[0].set(flat0)   # row 0 = init
@@ -234,13 +291,23 @@ def make_logging_trainer(model, knots, scales, mask, Xtr, atr, Xte, ate, *, max_
             th = optax.apply_updates(th, up)
             l = full_loss(th, tau)
             i = i + 1
-            bt = bt.at[i].set(ravel_pytree(th)[0])   # flatten with the same order
-            bl = bl.at[i].set(l)
+            if log_every == 1:
+                bt = bt.at[i].set(ravel_pytree(th)[0])   # flatten with the same order
+                bl = bl.at[i].set(l)
+            else:
+                slot = jnp.where(i % log_every == 0, i // log_every, rows - 1)
+                bt = bt.at[slot].set(ravel_pytree(th)[0])
+                bl = bl.at[slot].set(l)
             return th, s, i, l, k, bt, bl
 
         th, s, i, l, k, bt, bl = jax.lax.while_loop(
             cond, body, (theta, st, 0, l0, key, bt0, bl0))
-        # valid rows are 0..i; slice [:i+1] to drop the untouched tail.
+        if log_every > 1:    # always keep the final state, like _truncate(..., stride) does
+            slot = jnp.where(i % log_every != 0, i // log_every + 1, rows - 1)
+            bt = bt.at[slot].set(ravel_pytree(th)[0])
+            bl = bl.at[slot].set(l)
+        # log_every == 1: valid rows are 0..i, slice [:i+1] to drop the untouched tail.
+        # log_every > 1: see logged_rows(i, log_every).
         return th, i, l, bt, bl
 
     return train_log, full_loss, full_loss_valid, logits
@@ -256,6 +323,21 @@ def _truncate(bt, bl, n_steps, stride=1):
             keep.append(k - 1)               # always keep the final point
         bt, bl = bt[keep], bl[keep]
     return bt, bl
+
+
+def logged_rows(n_steps, log_every=1):
+    """Number of valid rows a make_logging_trainer(log_every=k) buffer holds after
+    n_steps steps: steps 0, k, 2k, ... plus the final state if it is not a multiple of k."""
+    n_steps = int(n_steps)
+    return n_steps // log_every + 1 + (1 if n_steps % log_every else 0)
+
+
+def _truncate_logged(bt, bl, n_steps, log_every=1):
+    """Host-side: the valid rows of a buffer recorded in-loop with log_every=k.
+    For k=1 this equals _truncate(bt, bl, n_steps); for k>1 it equals what
+    _truncate(bt_full, bl_full, n_steps, stride=k) gives, without the full buffer."""
+    r = logged_rows(n_steps, log_every)
+    return np.asarray(bt[:r]), np.asarray(bl[:r])
 
 
 def _triangle(cfg):
@@ -326,52 +408,6 @@ def _build(cfg):
                 unravel=unravel, kink=kink,
                 flat=lambda p: np.asarray(ravel_pytree(p)[0]))
 
-def save_setup(B, cfg, path):
-    """Freeze the reproducibility-critical setup to a .npz: the dataset
-    (Xtr/atr/Xte/ate), the derived near-boundary mask and kink mask, and the
-    flattened params0/knots/scales/mask pytrees, plus cfg. Loading this makes
-    the SETUP (data, init, kink config) byte-identical across runs regardless
-    of backend RNG. It does NOT freeze training-time backend nondeterminism
-    (e.g. GPU float ops) -- for that also set deterministic ops + x64."""
-    import os
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    f = B["flat"]
-    np.savez_compressed(
-        path,
-        Xtr=np.asarray(B["Xtr"]), atr=np.asarray(B["atr"]),
-        Xte=np.asarray(B["Xte"]), ate=np.asarray(B["ate"]),
-        near=np.asarray(B["near"]), kink=np.asarray(B["kink"]),
-        params0=f(B["params0"]), knots=f(B["knots"]),
-        scales=f(B["scales"]), mask=f(B["mask"]),
-        _cfg=np.array(json.dumps(cfg.as_dict())))
-    return path
- 
- 
-def load_setup(path):
-    """Rebuild a B dict identical to _build() from a save_setup() file, and the
-    cfg it was built with. The param-pytree STRUCTURE is regenerated from cfg
-    (deterministic: shapes don't depend on RNG) and used to unflatten the saved
-    vectors, so no functions/treedefs need to be pickled. Returns (B, cfg)."""
-    z = np.load(path, allow_pickle=False)
-    cfg = WMAMConfig(**json.loads(str(z["_cfg"])))
-    Xtr = z["Xtr"]
-    model = TinyCNN(channels=cfg.channels)
-    template = model.init(jax.random.PRNGKey(cfg.seed), Xtr[:1])["params"]
-    _, unravel = ravel_pytree(template)          # structure only; values unused
-    B = dict(
-        Xtr=Xtr, atr=z["atr"], Xte=z["Xte"], ate=z["ate"],
-        near=z["near"], kink=z["kink"], model=model,
-        params0=unravel(jnp.asarray(z["params0"])),
-        knots=unravel(jnp.asarray(z["knots"])),
-        scales=unravel(jnp.asarray(z["scales"])),
-        mask=unravel(jnp.asarray(z["mask"])),
-        unravel=unravel,
-        flat=lambda p: np.asarray(ravel_pytree(p)[0]))
-    return B, cfg
-
-
 def _run_cycle_logged(train_log, theta, down, up, key, rec, cyc, stride):
     max_loss = 0.0
     for t in down:
@@ -424,8 +460,10 @@ def count_knot_crossings(theta_traj, knots_flat, kink_mask):
 
 def cyclic_train_logged(cfg=None, verbose=True, out_path="runs/wmam_cyclic.npz",
                         setup=None, grad_clip=None,
-                        stride=1):
-    """Cold -> bulk cycles -> refine cycles, logging theta and loss every step.
+                        stride=1, batch_seed=1234):
+    """Cold -> bulk cycles -> refine cycles, logging theta and loss every step
+    (every `stride`-th step, plus each leg's final state, if stride > 1; the thinning
+    happens inside the training loop, see make_logging_trainer(log_every=)).
 
     Returns a dict of flat, step-aligned arrays:
       cycle (S,) int  (0 = cold training to tau_max) | tau (S,) | leg (S,)
@@ -439,17 +477,18 @@ def cyclic_train_logged(cfg=None, verbose=True, out_path="runs/wmam_cyclic.npz",
     common = dict(model=B["model"], knots=B["knots"], scales=B["scales"], mask=B["mask"],
                   Xtr=B["Xtr"], atr=B["atr"], Xte=B["Xte"], ate=B["ate"])
     bulk_log, _, full_loss_valid, _ = make_logging_trainer(
-        **common, max_steps=cfg.max_steps, tol=cfg.tol,
-        opt_name=cfg.bulk_optimizer, lr=cfg.lr, afactor=cfg.bulk_afactor,
-        batch=cfg.batch_size, grad_clip=grad_clip, augment=cfg.augment)
+        **common, max_steps=cfg.bulk_max_steps, tol=cfg.bulk_tol,
+        opt_name=cfg.bulk_optimizer, lr=cfg.bulk_lr, afactor=cfg.bulk_afactor,
+        batch=cfg.batch_size, grad_clip=grad_clip, augment=cfg.augment, log_every=stride)
     cold_log, _, _, _ = make_logging_trainer(
         **common, max_steps=cfg.refine_max_steps, tol=cfg.refine_tol,
-        opt_name="gd", lr=cfg.refine_lr, afactor=1.0, grad_clip=grad_clip)
+        opt_name=cfg.refine_optimizer, lr=cfg.refine_lr, afactor=cfg.refine_afactor,
+        batch=cfg.batch_size, grad_clip=grad_clip, log_every=stride)
 
     cyc_c, tau_c, leg_c, loss_c, th_rows = [], [], [], [], []
 
     def rec(bt, bl, ns, cyc, tau, leg):
-        bt, bl = _truncate(bt, bl, ns, stride)
+        bt, bl = _truncate_logged(bt, bl, ns, stride)
         k = len(bl)
         cyc_c.extend([cyc] * k); tau_c.extend([tau] * k)
         leg_c.extend([leg] * k); loss_c.extend(bl.tolist()); th_rows.append(bt)
@@ -459,7 +498,9 @@ def cyclic_train_logged(cfg=None, verbose=True, out_path="runs/wmam_cyclic.npz",
     kink_mask = B["kink"]
     dummy = jax.random.PRNGKey(0)
     down, up = _triangle(cfg)
-    key = jax.random.PRNGKey(cfg.seed + 1234)
+    print(down)
+    print(up)
+    key = jax.random.PRNGKey(cfg.seed + batch_seed)
 
     theta, ns, lc, bt, bl = cold_log(B["params0"], cfg.tau_max, dummy)
     rec(bt, bl, ns, 0, cfg.tau_max, "init")
@@ -469,7 +510,7 @@ def cyclic_train_logged(cfg=None, verbose=True, out_path="runs/wmam_cyclic.npz",
 
     dD, prev, theta_min, mam_cycle, count = [], theta, theta, -1, 0
     knot_crossings = []
-    for cyc in range(1, cfg.n_cycles + 1):
+    for cyc in range(1, cfg.bulk_cycles + 1):
         rows_before = len(th_rows)
         theta, theta_min, ml, key = _run_cycle_logged(
             bulk_log, theta, down, up, key, rec, cyc, stride)
@@ -481,6 +522,7 @@ def cyclic_train_logged(cfg=None, verbose=True, out_path="runs/wmam_cyclic.npz",
 
         converged = ml < cfg.converge_tol
         done = converged and (n_crossed == 0)
+        #done = converged and (n_crossed < 10)
         #plateaued = _dD_plateaued(dD, cfg.dD_patience, cfg.dD_plateau_rel)
         vl = full_loss_valid(theta, up[-1])
         if verbose and (cyc == 1 or cyc % 3 == 0):
@@ -502,15 +544,6 @@ def cyclic_train_logged(cfg=None, verbose=True, out_path="runs/wmam_cyclic.npz",
             break
           
     n_bulk = len(dD)
-
-#   for r in range(cfg.refine_cycles):
-#       theta, theta_min, ml, key = _run_cycle_logged(
-#           refine_log, theta, down, up, key, rec, n_bulk + 1 + r, stride)
-#       dD.append(_rms(jnp.asarray(flatf(theta) - flatf(prev)))); prev = theta
-#       vl = full_loss_valid(theta, up[-1])
-#       if verbose:
-#           print(f"  refine {r + 1:2d}  dD={dD[-1]:.2e}  max_loss={ml:.2e}  "
-#                 f"valid_loss={vl:.2e}")
     theta_max = theta
 
     log = dict(
@@ -531,9 +564,10 @@ def cyclic_train_logged(cfg=None, verbose=True, out_path="runs/wmam_cyclic.npz",
     return log
 
 def refine_cyclic_train_logged(cfg=None, load=None, verbose=True, out_path="runs/wmam_refine_cyclic.npz",
-                        setup=None, further=False, grad_clip=None,
-                        stride=1):
-    """refine cycles, logging theta and loss every step.
+                        setup=None, further=False, rescale_kink=False, grad_clip=None,
+                        stride=1, batch_seed=12345):
+    """refine cycles, logging theta and loss every step (every `stride`-th step, plus
+    each leg's final state, if stride > 1; thinned inside the training loop).
 
     Returns a dict of flat, step-aligned arrays:
       cycle (S,) int  (0 = cold training to tau_max) | tau (S,) | leg (S,)
@@ -549,15 +583,16 @@ def refine_cyclic_train_logged(cfg=None, load=None, verbose=True, out_path="runs
                   Xtr=B["Xtr"], atr=B["atr"], Xte=B["Xte"], ate=B["ate"])
     if further:
       refine_log, _, full_loss_valid, _ = make_logging_trainer(
-        **common, max_steps=cfg.max_steps, tol=cfg.tol,
-        opt_name=cfg.bulk_optimizer, lr=cfg.lr, afactor=cfg.bulk_afactor,
-        grad_clip=grad_clip)
+        **common, max_steps=cfg.refine_max_steps, tol=cfg.refine_tol,
+        opt_name=cfg.refine_optimizer, lr=cfg.refine_lr, afactor=cfg.refine_afactor,
+        batch=cfg.batch_size, rescale_kink=rescale_kink, grad_clip=grad_clip, log_every=stride)
       print("further bulk cyclic training")
     else:
       refine_log, _, full_loss_valid, _ = make_logging_trainer(
         **common, max_steps=cfg.refine_max_steps, tol=cfg.refine_tol,
-        opt_name="gd", lr=cfg.refine_lr, afactor=1.0, grad_clip=grad_clip)
-      print(cfg.kink_fraction, cfg.refine_lr, cfg.refine_tol, cfg.refine_max_steps)
+        opt_name=cfg.refine_optimizer, lr=cfg.refine_lr, afactor=cfg.refine_afactor, 
+        rescale_kink=rescale_kink, batch=cfg.batch_size, grad_clip=grad_clip, log_every=stride)
+      print(cfg.kink_fraction, cfg.refine_lr, cfg.refine_tol, cfg.batch_size, cfg.refine_max_steps)
 
 
     if load:
@@ -575,7 +610,7 @@ def refine_cyclic_train_logged(cfg=None, load=None, verbose=True, out_path="runs
     cyc_c, tau_c, leg_c, loss_c, th_rows = [], [], [], [], []
 
     def rec(bt, bl, ns, cyc, tau, leg):
-        bt, bl = _truncate(bt, bl, ns, stride)
+        bt, bl = _truncate_logged(bt, bl, ns, stride)
         k = len(bl)
         cyc_c.extend([cyc] * k); tau_c.extend([tau] * k)
         leg_c.extend([leg] * k); loss_c.extend(bl.tolist()); th_rows.append(bt)
@@ -583,9 +618,8 @@ def refine_cyclic_train_logged(cfg=None, load=None, verbose=True, out_path="runs
     flatf = B["flat"]
     knots_flat = flatf(B["knots"])
     kink_mask = B["kink"]
-    dummy = jax.random.PRNGKey(0)
     down, up = _triangle(cfg)
-    key = jax.random.PRNGKey(cfg.seed + 12345)
+    key = jax.random.PRNGKey(cfg.seed + batch_seed)
 
     dD, prev, theta_min, mam_cycle, count = [], theta_max, theta_min, -1, 0
     theta = theta_max
@@ -636,7 +670,7 @@ def refine_cyclic_train_logged(cfg=None, load=None, verbose=True, out_path="runs
     return log
 
 def readout_logged(cfg=None, load=None, verbose=True, do_cold=None, setup=None,
-                   out_path="runs/wmam_readout.npz", grad_clip=None, stride=1):
+                   out_path="runs/wmam_readout.npz", rescale_kink=True, grad_clip=None, stride=1):
     """Behavioral readout (same observables as run_wmam's do_readout), logging
     every step of each retrain leg. theta_max/theta_min come from a recalled
     cyclic log (`load=...`) or from a fresh cyclic pass if none is given."""
@@ -649,9 +683,11 @@ def readout_logged(cfg=None, load=None, verbose=True, do_cold=None, setup=None,
         **common, 
         max_steps=cfg.readout_max_steps, 
         tol=cfg.readout_tol,
-        opt_name="gd", lr=cfg.refine_lr, afactor=1.0, grad_clip=grad_clip)
-    budget = make_budget(B["model"], B["knots"], B["scales"], B["mask"],
-                         B["Xtr"], B["atr"], cfg.budget_steps, cfg.refine_lr)
+        opt_name=cfg.refine_optimizer, lr=cfg.refine_lr, afactor=cfg.refine_afactor, 
+        rescale_kink=rescale_kink, batch=cfg.batch_size, grad_clip=grad_clip)
+    budget = make_budget(B["model"], cfg.refine_optimizer, B["knots"], B["scales"], B["mask"],
+                         B["Xtr"], B["atr"], cfg.budget_steps, cfg.refine_lr,
+                         rescale_kink=rescale_kink, grad_clip=grad_clip)
     print(cfg.refine_lr)
 
     def probs_test(p):
@@ -762,81 +798,3 @@ def load_log(path):
 # ----------------------------------------------------------------------------
 # Entry point: one flag chooses cyclic training or readout
 # ----------------------------------------------------------------------------
-def _parse_args():
-    import argparse
-    p = argparse.ArgumentParser(
-        description="Per-step-logged cyclic training OR readout for the "
-                    "weight-adapting MAM.")
-    p.add_argument("--bulk-optimizer", type=str, default="adam")
-    p.add_argument("--further", action="store_true",
-                   help="run further bulk cyclic training")
-    p.add_argument("--refine", action="store_true",
-                   help="run the refine instead of bulk cyclic training")
-    p.add_argument("--readout", action="store_true",
-                   help="run the readout instead of cyclic training")
-    p.add_argument("--docold", action="store_true",
-                   help="run the readout for cold cycle")
-    p.add_argument("--load", default=None,
-                   help="readout: recall theta_max/theta_min from a saved "
-                        "cyclic log (else a cyclic pass is run first)")
-    p.add_argument("--out", default=None, help="output .npz (auto-named if omitted)")
-    p.add_argument("--stride", type=int, default=1,
-                   help=">1 thins stored steps")
-    p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--kink-fraction", type=float, default=0.0)
-    p.add_argument("--grad-clip", type=float, default=None)
-    p.add_argument("--lr", type=float, default=None)
-    p.add_argument("--tol", type=float, default=None)
-    p.add_argument("--maxsteps", type=int, default=None)
-    p.add_argument("--setup", default=None,
-                   help="path to a frozen setup .npz: loaded if it exists "
-                        "(guarantees identical data/init/kinks), else built "
-                        "and saved there")
-    return p.parse_args()
-
-
-def main():
-    a = _parse_args()
-    overrides = {}
-    if a.seed is not None:
-      overrides["seed"] = a.seed
-    if a.lr is not None:
-      overrides["refine_lr"] = a.lr
-    if a.tol is not None:
-      overrides["refine_tol"] = a.tol
-    if a.maxsteps is not None:
-      overrides["refine_max_steps"] = a.maxsteps
-    overrides["bulk_optimizer"] = a.bulk_optimizer
-    overrides["kink_fraction"] = a.kink_fraction
-    cfg = WMAMConfig(**overrides)
-    print("kink fraction:{}".format(cfg.kink_fraction))
-    print("maxstep:{}".format(cfg.refine_max_steps))
-    #cfg = WMAMConfig() if a.seed is None else WMAMConfig(seed=a.seed)
-
-    B = None
-    if a.setup:
-        if os.path.exists(a.setup):
-            B, _ = load_setup(a.setup)        # frozen data/init/kinks + cfg
-            print(f"[setup] loaded frozen setup from {a.setup}")
-        else:
-            B = _build(cfg)
-            save_setup(B, cfg, a.setup)
-            print(f"[setup] built and froze setup -> {a.setup}")
-
-    if a.readout:
-        readout_logged(cfg, load=a.load, stride=a.stride, do_cold=a.docold,
-                       setup=B, grad_clip=a.grad_clip,
-                       out_path=a.out or "runs/wmam_readout.npz")
-    elif a.refine:
-        refine_cyclic_train_logged(cfg, load=a.load, stride=a.stride, setup=B,
-                       further=a.further, grad_clip=a.grad_clip,
-                       out_path=a.out or "runs/wmam_refine_cyclic.npz")
-    else:
-        cyclic_train_logged(cfg, stride=a.stride, setup=B, grad_clip=a.grad_clip,
-                            out_path=a.out or "runs/wmam_cyclic.npz")
-
-
-if __name__ == "__main__":
-    import os
-    os.makedirs("runs", exist_ok=True)
-    main()

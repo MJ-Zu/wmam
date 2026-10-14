@@ -1,0 +1,16 @@
+{
+  "base": "setups/example_cyclic.setup.pkl",
+  "cfg": {
+    "refine_optimizer": "gd",
+    "refine_lr": 4e-06,
+    "refine_afactor": 1.0,
+    "refine_max_steps": 3000,
+    "refine_tol": 1e-07,
+    "refine_cycles": 100
+  },
+  "run": {
+    "mode": "refine",
+    "load": "runs/example_further.npz",
+    "grad_clip": 100.0
+  }
+}

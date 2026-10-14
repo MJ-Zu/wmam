@@ -1,0 +1,27 @@
+{
+  "cfg": {
+    "data": "data/disk_data_100_150_strat.npz",
+    "img": 16,
+    "channels": 6,
+    "kink_fraction": 0.4,
+    "s_low": 100.0,
+    "s_high": 100.0,
+    "seed": 11658,
+    "seed_kink": 24231,
+    "tau_max": 0.55,
+    "bulk_optimizer": "gd",
+    "bulk_lr": 0.0001,
+    "bulk_max_steps": 10000,
+    "bulk_tol": 1e-10,
+    "refine_optimizer": "gd",
+    "refine_lr": 3e-05,
+    "refine_max_steps": 1000,
+    "refine_tol": 1e-10,
+    "log_every": 10
+  },
+  "run": {
+    "mode": "single_tau",
+    "tau": 0.55,
+    "grad_clip": 100.0
+  }
+}

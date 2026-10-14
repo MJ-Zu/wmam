@@ -1,0 +1,27 @@
+{
+  "cfg": {
+    "data": "data/disk_data_100_150_strat.npz",
+    "img": 16,
+    "n_train": 100,
+    "n_test": 150,
+    "channels": 6,
+    "kink_fraction": 0.4,
+    "s_low": 50.0,
+    "s_high": 50.0,
+    "seed": 27140,
+    "tau_min": 0.5,
+    "tau_max": 0.55,
+    "increment": 0.01,
+    "near_band": 0.12,
+    "bulk_optimizer": "adam",
+    "bulk_lr": 0.001,
+    "bulk_max_steps": 500,
+    "bulk_cycles": 30,
+    "refine_max_steps": 1000
+  },
+  "run": {
+    "mode": "cyclic",
+    "grad_clip": 10.0,
+    "stride": 1
+  }
+}

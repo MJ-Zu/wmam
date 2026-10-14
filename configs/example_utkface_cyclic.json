@@ -1,0 +1,27 @@
+{
+  "cfg": {
+    "data": "data/utkface_100_150_64.npz",
+    "img": 64,
+    "n_train": 100,
+    "n_test": 150,
+    "channels": 24,
+    "kink_fraction": 0.4,
+    "s_low": 50.0,
+    "s_high": 50.0,
+    "seed": 1,
+    "tau_min": 38.0,
+    "tau_max": 43.0,
+    "increment": 1.0,
+    "near_band": 6.0,
+    "bulk_optimizer": "adam",
+    "bulk_lr": 0.0001,
+    "bulk_max_steps": 2000,
+    "bulk_cycles": 10,
+    "refine_max_steps": 2000
+  },
+  "run": {
+    "mode": "cyclic",
+    "grad_clip": 10.0,
+    "stride": 20
+  }
+}
